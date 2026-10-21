@@ -147,6 +147,7 @@ def download_thumbnail(video_id: str, thumbnails: dict) -> tuple[str | None, str
             suffix = ".jpg"
         rel_path = Path("Thumbnail") / f"{video_id}{suffix}"
         dest = ROOT / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             request = Request(url, headers={"User-Agent": "clickbait-dataset-collector/1.0"})
             with urlopen(request, timeout=30) as response, dest.open("wb") as out:
