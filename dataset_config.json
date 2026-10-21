@@ -1,0 +1,20 @@
+{
+  "expected_categories": [
+    "REPLACE_WITH_CATEGORY_1",
+    "REPLACE_WITH_CATEGORY_2",
+    "REPLACE_WITH_CATEGORY_3",
+    "REPLACE_WITH_CATEGORY_4",
+    "REPLACE_WITH_CATEGORY_5",
+    "REPLACE_WITH_CATEGORY_6",
+    "REPLACE_WITH_CATEGORY_7",
+    "REPLACE_WITH_CATEGORY_8",
+    "REPLACE_WITH_CATEGORY_9",
+    "REPLACE_WITH_CATEGORY_10"
+  ],
+  "videos_per_category": 20,
+  "labels_per_category": {
+    "normal": 10,
+    "clickbait": 10
+  },
+  "default_comment_limit": 100
+}
