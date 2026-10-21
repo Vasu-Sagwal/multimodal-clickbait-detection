@@ -13,8 +13,9 @@
   ],
   "videos_per_category": 100,
   "labels_per_category": {
-    "normal": 50,
-    "clickbait": 50
+    "0": 50,
+    "1": 50
   },
-  "default_comment_limit": 100
+  "default_comment_limit": 20
 }
+
