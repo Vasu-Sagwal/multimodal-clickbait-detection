@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "videos.json"
 CONFIG = ROOT / "dataset_config.json"
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-VALID_LABELS = {"normal", "clickbait"}
+LABELS = {"normal": 0, "clickbait": 1, "0": 0, "1": 1}
 
 
 class CollectionError(RuntimeError):
@@ -47,7 +47,7 @@ def youtube_video_id(value: str) -> str:
     video_id = ""
     if host in {"youtu.be", "www.youtu.be"}:
         video_id = parsed.path.strip("/").split("/")[0]
-    elif host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+    elif host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"}:
         if parsed.path == "/watch":
             video_id = parse_qs(parsed.query).get("v", [""])[0]
         else:
@@ -64,6 +64,11 @@ def api_get(endpoint: str, params: dict[str, str]) -> dict:
 
     url = f"https://www.googleapis.com/youtube/v3/{endpoint}?{urlencode(params)}"
     request = Request(url, headers={"Accept": "application/json", "User-Agent": "clickbait-dataset-collector/1.0"})
+    secret = params.get("key")
+
+    def redact(message: str) -> str:
+        return message.replace(secret, "[REDACTED]") if secret else message
+
     try:
         with urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
@@ -77,9 +82,9 @@ def api_get(endpoint: str, params: dict[str, str]) -> dict:
                 message += f" ({', '.join(reasons)})"
         except Exception:
             message = str(exc)
-        raise CollectionError(f"YouTube API {endpoint} failed: {message}") from exc
+        raise CollectionError(f"YouTube API {endpoint} failed: {redact(message)}") from exc
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise CollectionError(f"YouTube API {endpoint} request failed: {exc}") from exc
+        raise CollectionError(f"YouTube API {endpoint} request failed: {redact(str(exc))}") from exc
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -182,7 +187,8 @@ def collect_transcript(video_id: str) -> dict:
             return {"status": "unavailable", "language": None, "segments": [], "error": str(exc or first_error)}
 
 
-def collect_comments(video_id: str, api_key: str, limit: int) -> dict:
+def collect_comments(video_id: str, api_key: str, limit: int, order: str) -> dict:
+    limit = min(max(0, limit), 20)
     comments = []
     page_token = None
     try:
@@ -192,7 +198,7 @@ def collect_comments(video_id: str, api_key: str, limit: int) -> dict:
                 "videoId": video_id,
                 "maxResults": str(min(100, limit - len(comments))),
                 "textFormat": "plainText",
-                "order": "relevance",
+                "order": order,
                 "key": api_key,
             }
             if page_token:
@@ -216,18 +222,38 @@ def collect_comments(video_id: str, api_key: str, limit: int) -> dict:
         return {"status": status, "count": len(comments), "items": comments, "error": str(exc)}
 
 
-def validate_row(row: dict, row_number: int, categories: set[str]) -> tuple[str, str, str]:
+def normalize_label(value: object) -> int:
+    label = "" if value is None else str(value).strip().lower()
+    if label not in LABELS:
+        raise CollectionError("label must be 0 (normal) or 1 (clickbait).")
+    return LABELS[label]
+
+
+def normalize_manifest_label(value: object) -> int:
+    """Read current integer labels and legacy text labels consistently for audits/resume."""
+    if isinstance(value, bool):
+        raise CollectionError(f"Invalid label in videos.json: {value!r}")
+    try:
+        return normalize_label(value)
+    except CollectionError as exc:
+        raise CollectionError(f"Invalid label in videos.json: {value!r}") from exc
+
+
+def validate_row(row: dict, row_number: int, categories: list[str]) -> tuple[str, str, int]:
     url = (row.get("video_url") or "").strip()
     category = (row.get("category") or "").strip()
-    label = (row.get("label") or "").strip().lower()
+    label_value = row.get("label")
     reviewer = (row.get("reviewer") or "").strip()
-    if not url or not category or not label or not reviewer:
+    if not url or not category or label_value is None or not str(label_value).strip() or not reviewer:
         raise CollectionError(f"Row {row_number}: video_url, category, label, and reviewer are required.")
-    if label not in VALID_LABELS:
-        raise CollectionError(f"Row {row_number}: label must be 'normal' or 'clickbait'.")
-    if categories and category not in categories:
+    try:
+        label = normalize_label(label_value)
+    except CollectionError as exc:
+        raise CollectionError(f"Row {row_number}: {exc}") from exc
+    canonical = {item.strip().casefold(): item for item in categories}
+    if categories and category.casefold() not in canonical:
         raise CollectionError(f"Row {row_number}: category {category!r} is not listed in dataset_config.json.")
-    return youtube_video_id(url), category, label
+    return youtube_video_id(url), canonical.get(category.casefold(), category), label
 
 
 def load_config() -> dict:
@@ -240,20 +266,22 @@ def run_audit() -> int:
     if not categories or any(str(item).startswith("REPLACE_WITH_") for item in categories):
         print("Set the ten real category names in dataset_config.json before running the audit.")
         return 2
-    if len(categories) != 10 or len(set(categories)) != 10:
+    if len(categories) != 10 or len({str(item).strip().casefold() for item in categories}) != 10:
         print("dataset_config.json must list exactly 10 unique categories.")
         return 2
     records = read_manifest()
     failed = False
-    target = int(config.get("videos_per_category", 20))
-    expected = config.get("labels_per_category", {"normal": target // 2, "clickbait": target // 2})
+    target = int(config.get("videos_per_category", 100))
+    expected = config.get("labels_per_category", {"0": target // 2, "1": target // 2})
     for category in categories:
-        rows = [record for record in records if record.get("category") == category]
-        counts = {label: sum(record.get("label") == label for record in rows) for label in VALID_LABELS}
-        ok = len(rows) == target and all(counts.get(label, 0) == int(expected.get(label, 0)) for label in VALID_LABELS)
-        print(f"{category}: {len(rows)}/{target}; normal={counts['normal']}, clickbait={counts['clickbait']} {'OK' if ok else 'INCOMPLETE'}")
+        rows = [record for record in records if str(record.get("category", "")).strip().casefold() == category.strip().casefold()]
+        counts = {0: sum(normalize_manifest_label(record.get("label")) == 0 for record in rows), 1: sum(normalize_manifest_label(record.get("label")) == 1 for record in rows)}
+        normal_expected = int(expected.get("0", expected.get("normal", target // 2)))
+        clickbait_expected = int(expected.get("1", expected.get("clickbait", target // 2)))
+        ok = len(rows) == target and counts[0] == normal_expected and counts[1] == clickbait_expected
+        print(f"{category}: {len(rows)}/{target}; normal=0: {counts[0]}, clickbait=1: {counts[1]} {'OK' if ok else 'INCOMPLETE'}")
         failed |= not ok
-    extra = sorted({record.get("category") for record in records} - set(categories))
+    extra = sorted({record.get("category") for record in records if str(record.get("category", "")).strip().casefold() not in {c.strip().casefold() for c in categories}})
     if extra:
         print("Unconfigured categories in videos.json: " + ", ".join(map(str, extra)))
         failed = True
@@ -264,61 +292,109 @@ def run_audit() -> int:
 def collect(input_path: Path, max_comments: int, refresh: bool) -> int:
     load_env_file()
     api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
-    if not api_key or api_key == "replace_me":
-        print("Set YOUTUBE_API_KEY in your environment or .env file.", file=sys.stderr)
-        return 2
     if not input_path.is_absolute():
         input_path = ROOT / input_path
     config = load_config()
-    categories = set(config.get("expected_categories", []))
+    categories = config.get("expected_categories", [])
     try:
         with input_path.open(encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
+            reader = csv.DictReader(handle)
+            rows = []
+            for row in reader:
+                rows.append((row, reader.line_num))
     except OSError as exc:
         print(f"Cannot read input CSV {input_path}: {exc}", file=sys.stderr)
         return 2
     records = read_manifest()
     by_id = {record.get("video_id"): record for record in records}
     errors = 0
-    seen_in_file = set()
-    for row_number, row in enumerate(rows, start=2):
+    validated = []
+    by_csv_id: dict[str, list[dict]] = {}
+    # Full pre-validation pass: no video, thumbnail, transcript, or comment API work occurs here.
+    for serial, (row, physical) in enumerate(rows, start=1):
+        url = (row.get("video_url") or "").strip()
+        if url:
+            try:
+                candidate_id = youtube_video_id(url)
+                by_csv_id.setdefault(candidate_id, []).append({"video_id": candidate_id, "row": row, "serial": serial, "physical": physical})
+            except CollectionError:
+                pass
         try:
-            video_id, category, label = validate_row(row, row_number, categories)
-            if video_id in seen_in_file:
-                raise CollectionError(f"Row {row_number}: duplicate video URL in this CSV.")
-            seen_in_file.add(video_id)
-            if video_id in by_id and not refresh:
+            video_id, category, label = validate_row(row, physical, categories)
+            entry = {"video_id": video_id, "category": category, "label": label, "row": row, "serial": serial, "physical": physical}
+            validated.append(entry)
+        except (CollectionError, OSError, csv.Error, json.JSONDecodeError) as exc:
+            errors += 1
+            print(f"ERROR: {exc}", file=sys.stderr)
+
+    duplicate_ids = {video_id for video_id, entries in by_csv_id.items() if len(entries) > 1}
+    for video_id, entries in by_csv_id.items():
+        exists = video_id in by_id
+        if video_id in duplicate_ids or exists:
+            serials = ", ".join(str(e["serial"]) for e in entries)
+            lines = ", ".join(str(e["physical"]) for e in entries)
+            kind = "duplicate within CSV" if video_id in duplicate_ids else "already exists in videos.json"
+            if video_id in duplicate_ids and exists:
+                kind += " and already exists in videos.json"
+            print(f"DUPLICATE: Video ID {video_id} - CSV serials {serials} (physical lines {lines}); {kind}. Skipping all occurrences.")
+            for entry in entries:
+                row = entry["row"]
+                print(f"  serial {entry['serial']} (line {entry['physical']}): reviewer={row.get('reviewer','')!r}, label={row.get('label','')!r}")
+
+    if not api_key or api_key == "replace_me":
+        print("Set YOUTUBE_API_KEY in your environment or .env file.", file=sys.stderr)
+        return 2
+
+    for entry in validated:
+        video_id, category, label, row = entry["video_id"], entry["category"], entry["label"], entry["row"]
+        if video_id in duplicate_ids:
+            continue
+        existing = by_id.get(video_id)
+        if existing:
+            try:
+                existing_label = normalize_manifest_label(existing.get("label"))
+            except CollectionError as exc:
+                errors += 1
+                print(f"ERROR: Video ID {video_id} has an invalid existing label: {exc}", file=sys.stderr)
+                continue
+            if existing_label != label:
+                errors += 1
+                print(f"ERROR: Video ID {video_id} has conflicting existing label; refusing to overwrite it.", file=sys.stderr)
+                continue
+            if not refresh:
                 print(f"SKIP {video_id}: already present (use --refresh to recollect).")
                 continue
 
+        try:
             metadata = fetch_video(video_id, api_key)
             thumbnail_path, thumbnail_error = download_thumbnail(video_id, metadata.pop("thumbnails"))
             transcript = collect_transcript(video_id)
             transcript_path = Path("transcript") / f"{video_id}.json"
             atomic_json(ROOT / transcript_path, transcript)
-            comments = collect_comments(video_id, api_key, max_comments)
-            comments_path = Path("comments") / f"{video_id}.json"
-            atomic_json(ROOT / comments_path, comments)
+            comments = {order: collect_comments(video_id, api_key, max_comments, order) for order in ("relevance", "time")}
+            comments_paths = {"relevance": Path("comments") / f"{video_id}_top.json", "time": Path("comments") / f"{video_id}_newest.json"}
+            for order, path in comments_paths.items():
+                atomic_json(ROOT / path, comments[order])
 
             record = {
                 "video_id": video_id,
                 "video_url": f"https://www.youtube.com/watch?v={video_id}",
                 "category": category,
                 "label": label,
-                "label_reviewer": (row.get("reviewer") or "").strip(),
-                "label_notes": (row.get("notes") or "").strip(),
+                "label_reviewer": (row.get("reviewer") or existing.get("label_reviewer", "") if existing else (row.get("reviewer") or "")).strip(),
+                "label_notes": (row.get("notes") or existing.get("label_notes", "") if existing else (row.get("notes") or "")).strip(),
                 "metadata": metadata,
                 "thumbnail_path": thumbnail_path,
                 "transcript_path": transcript_path.as_posix(),
                 "transcript_status": transcript["status"],
-                "comments_path": comments_path.as_posix(),
-                "comments_status": comments["status"],
-                "comments_collected": comments["count"],
+                "comments_paths": {"top": comments_paths["relevance"].as_posix(), "newest": comments_paths["time"].as_posix()},
+                "comments_status": {"top": comments["relevance"]["status"], "newest": comments["time"]["status"]},
+                "comments_collected": {"top": comments["relevance"]["count"], "newest": comments["time"]["count"]},
                 "collection_timestamp": datetime.now(timezone.utc).isoformat(),
                 "collection_warnings": [message for message in (
                     f"Thumbnail unavailable: {thumbnail_error}" if thumbnail_error else None,
                     f"Transcript unavailable: {transcript['error']}" if transcript.get("error") else None,
-                    f"Comments: {comments['error']}" if comments.get("error") else None,
+                    *(f"Comments ({name}): {item['error']}" for name, item in (("top", comments["relevance"]), ("newest", comments["time"])) if item.get("error")),
                 ) if message],
             }
             by_id[video_id] = record
@@ -338,16 +414,17 @@ def main() -> int:
     parser.add_argument("--input", default="data/submissions.csv", help="CSV containing manually labeled video submissions.")
     parser.add_argument("--max-comments", type=int, default=None, help="Maximum top-level comments per video (default from dataset_config.json).")
     parser.add_argument("--refresh", action="store_true", help="Recollect videos already present in videos.json.")
-    parser.add_argument("--audit", action="store_true", help="Check the 10 × 20 balanced collection target.")
+    parser.add_argument("--audit", action="store_true", help="Check the 10 × 100 balanced collection target.")
     args = parser.parse_args()
     if args.audit:
         return run_audit()
     config = load_config()
-    max_comments = args.max_comments if args.max_comments is not None else int(config.get("default_comment_limit", 100))
-    if max_comments < 0:
-        parser.error("--max-comments cannot be negative")
+    max_comments = args.max_comments if args.max_comments is not None else int(config.get("default_comment_limit", 20))
+    if not 0 <= max_comments <= 20:
+        parser.error("--max-comments must be between 0 and 20 per collection")
     return collect(Path(args.input), max_comments, args.refresh)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
