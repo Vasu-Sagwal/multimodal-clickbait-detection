@@ -49,7 +49,29 @@ def load_env_file() -> None:
 
 def api_keys() -> list[str]:
     raw = os.getenv("YOUTUBE_API_KEYS", "") or os.getenv("YOUTUBE_API_KEY", "")
-    return list(dict.fromkeys(k.strip() for k in raw.split(",") if k.strip() and k.strip() != "replace_me"))
+    return [k.strip() for k in raw.split(",") if k.strip() and k.strip() != "replace_me"]
+
+
+def api_credentials() -> list[tuple[str, str]]:
+    keys = api_keys()
+    if not keys:
+        return []
+    raw_projects = os.getenv("YOUTUBE_API_KEY_PROJECTS", "").strip()
+    if raw_projects:
+        projects = [value.strip() for value in raw_projects.split(",")]
+        if len(projects) != len(keys) or any(not value for value in projects):
+            raise CollectionError("YOUTUBE_API_KEY_PROJECTS must list one non-empty project ID per key, in matching order.")
+    else:
+        default_project = os.getenv("YOUTUBE_QUOTA_PROJECT", "default").strip() or "default"
+        projects = [default_project] * len(keys)
+    credentials, assigned = [], {}
+    for key, project in zip(keys, projects):
+        if key in assigned and assigned[key] != project:
+            raise CollectionError("The same API key cannot be assigned to multiple project IDs.")
+        assigned[key] = project
+        if (key, project) not in credentials:
+            credentials.append((key, project))
+    return credentials
 
 
 def read_json(path: Path, default):
@@ -127,36 +149,78 @@ def load_csv(path: Path, categories: list[str]) -> tuple[list[dict], dict]:
     return entries, {"headers": headers, "submitted_rows": submitted_rows, "issues": issues, "warnings": warnings}
 
 
+def validate_dataset_config(entries: list[dict], report: dict, config: dict) -> None:
+    """Compare the immutable CSV with its checked-in dataset summary."""
+    warnings = report.setdefault("warnings", [])
+    target = config.get("target_total_videos")
+    if target is not None and len(entries) != int(target):
+        warnings.append({"issue":f"dataset has {len(entries)} unique valid videos; config expects {target}"})
+    expected_categories = config.get("category_counts", {})
+    if expected_categories:
+        actual = {}
+        for entry in entries:
+            actual[entry["category"]] = actual.get(entry["category"], 0) + 1
+        for category in sorted(set(expected_categories) | set(actual)):
+            expected, observed = int(expected_categories.get(category, 0)), actual.get(category, 0)
+            if expected != observed:
+                warnings.append({"issue":f"category count for {category!r} is {observed}; config expects {expected}"})
+    expected_labels = config.get("label_counts", {})
+    for label in ("0", "1"):
+        if label in expected_labels:
+            observed = sum(entry["label"] == int(label) for entry in entries)
+            if observed != int(expected_labels[label]):
+                warnings.append({"issue":f"label {label} count is {observed}; config expects {expected_labels[label]}"})
+
+
 class YouTubeClient:
     # videos.list costs 1 unit; commentThreads.list costs 1 unit.
-    def __init__(self, keys: list[str], state: dict, daily_limit: int, buffer: int):
-        self.keys, self.state = keys, state
-        self.project = os.getenv("YOUTUBE_QUOTA_PROJECT", "default")
+    def __init__(self, keys: list[str] | list[tuple[str, str]], state: dict, daily_limit: int, buffer: int, checkpoint=None):
+        default_project = os.getenv("YOUTUBE_QUOTA_PROJECT", "default")
+        self.credentials = [(item, default_project) if isinstance(item, str) else item for item in keys]
+        self.state = state
         self.daily_limit, self.buffer = daily_limit, buffer
         self.key_index = 0
         self.bad_keys: set[int] = set()
+        self.exhausted_projects: set[str] = set()
+        self.checkpoint = checkpoint
+
+    def quota_for(self, project: str) -> dict:
+        quota = self.state.setdefault("quota", {}).setdefault(project, {"date":quota_day(), "used":0, "total_used":0})
+        quota.setdefault("total_used", quota.get("used", 0))
+        if quota.get("date") != quota_day():
+            quota.update(date=quota_day(), used=0)
+        return quota
+
+    def available_calls(self) -> int:
+        projects = {project for _, project in self.credentials}
+        return sum(max(0, self.daily_limit-self.buffer-self.quota_for(project).get("used", 0)) for project in projects)
 
     def get(self, endpoint: str, params: dict, cost: int = 1):
-        quota = self.state.setdefault("quota", {}).setdefault(self.project, {"date": quota_day(), "used": 0, "total_used": 0})
-        quota.setdefault("total_used", quota.get("used", 0))
-        today = quota_day()
-        if quota.get("date") != today:
-            quota.update(date=today, used=0)
-        if quota.get("used", 0) + cost > self.daily_limit - self.buffer:
-            raise QuotaPaused("Configured daily quota safety limit reached; progress saved for the next run.")
         errors = []
-        while len(self.bad_keys) < len(self.keys):
-            idx = self.key_index % len(self.keys)
+        saw_quota_exhaustion = False
+        for _ in range(len(self.credentials)):
+            idx = self.key_index % len(self.credentials)
             self.key_index += 1
             if idx in self.bad_keys:
                 continue
-            query = dict(params, key=self.keys[idx])
+            key, project = self.credentials[idx]
+            if project in self.exhausted_projects:
+                continue
+            quota = self.quota_for(project)
+            if quota.get("used", 0) + cost > self.daily_limit-self.buffer:
+                self.exhausted_projects.add(project)
+                saw_quota_exhaustion = True
+                continue
+            query = dict(params, key=key)
             request = Request(f"https://www.googleapis.com/youtube/v3/{endpoint}?{urlencode(query)}", headers={"Accept":"application/json"})
             try:
-                with urlopen(request, timeout=30) as response:
-                    data = json.loads(response.read().decode("utf-8"))
+                # Count every attempted request conservatively, including API errors.
                 quota["used"] = quota.get("used", 0) + cost
                 quota["total_used"] = quota.get("total_used", 0) + cost
+                if self.checkpoint:
+                    self.checkpoint()
+                with urlopen(request, timeout=30) as response:
+                    data = json.loads(response.read().decode("utf-8"))
                 return data
             except HTTPError as exc:
                 try:
@@ -164,16 +228,23 @@ class YouTubeClient:
                     reason = next((e.get("reason", "") for e in body.get("error", {}).get("errors", [])), "")
                 except Exception:
                     reason = ""
-                # Never switch keys to gain another project's daily quota.
                 if reason in {"quotaExceeded", "dailyLimitExceeded", "dailyLimitExceededUnreg"}:
-                    raise QuotaPaused("YouTube project quota is exhausted; progress saved for the next run.") from exc
+                    self.exhausted_projects.add(project)
+                    saw_quota_exhaustion = True
+                    if self.checkpoint:
+                        self.checkpoint()
+                    continue
                 if reason in {"keyInvalid", "authError", "ipRefererBlocked"} or exc.code == 401:
                     self.bad_keys.add(idx)
                     errors.append(reason or f"HTTP {exc.code}")
+                    if self.checkpoint:
+                        self.checkpoint()
                     continue
                 raise CollectionError(f"YouTube API {endpoint} request failed ({reason or f'HTTP {exc.code}'}).") from exc
             except (URLError, TimeoutError, json.JSONDecodeError) as exc:
                 raise CollectionError(f"YouTube API {endpoint} temporary request failure: {type(exc).__name__}.") from exc
+        if saw_quota_exhaustion:
+            raise QuotaPaused("All configured YouTube API projects reached their daily safety limit; progress saved for reset.")
         raise CollectionError("No usable YouTube API credentials remain: " + ", ".join(errors))
 
 
@@ -333,18 +404,23 @@ def done(state: dict, vid: str, modality: str) -> bool:
 
 def collect(input_path: Path, limit: int, daily_limit: int, buffer: int) -> int:
     load_env_file()
-    keys = api_keys()
-    if not keys:
+    try:
+        credentials = api_credentials()
+    except CollectionError as exc:
+        print(f"Credential configuration error: {exc}", file=sys.stderr)
+        return 2
+    if not credentials:
         print("Set YOUTUBE_API_KEYS (comma separated) in .env.", file=sys.stderr)
         return 2
     config = read_json(CONFIG, {})
     if not input_path.is_absolute(): input_path = ROOT / input_path
     try:
         entries, validation = load_csv(input_path, config.get("expected_categories", []))
+        validate_dataset_config(entries, validation, config)
     except (OSError, CollectionError, csv.Error) as exc:
         print(f"Input error: {exc}", file=sys.stderr); return 2
     state = read_json(STATE, {"videos":{}, "quota":{}})
-    client = YouTubeClient(keys, state, daily_limit, buffer)
+    client = YouTubeClient(credentials, state, daily_limit, buffer, checkpoint=lambda: atomic_json(STATE,state))
     records = {x.get("video_id"):x for x in read_json(MANIFEST, []) if x.get("video_id")}
     # Submission rows update only their human annotations; modality data is retained.
     for entry in entries:
@@ -352,13 +428,8 @@ def collect(input_path: Path, limit: int, daily_limit: int, buffer: int) -> int:
         records[entry["video_id"]] = {**old, **entry}
     hydrate_existing_state(state, records, entries)
     missing_metadata = [e["video_id"] for e in entries if not done(state,e["video_id"],"metadata")]
-    quota = state.setdefault("quota", {}).setdefault(client.project, {})
-    today = quota_day()
-    if quota.get("date") != today:
-        quota.update(date=today, used=0)
-    quota.setdefault("total_used", quota.get("used", 0))
     projected_calls = len(missing_metadata) // 50 + bool(len(missing_metadata) % 50)
-    metadata_paused = quota.get("used", 0) + projected_calls > daily_limit - buffer
+    metadata_paused = client.available_calls() < projected_calls
     atomic_json(MANIFEST, active_records(records, entries))
     atomic_json(STATE,state)
     def checkpoint_metadata(batch, result, batch_index):
@@ -438,30 +509,39 @@ def write_report(entries: list[dict], validation: dict, state: dict) -> None:
     videos = state.get("videos", {})
     counts = {m:sum(1 for e in entries if done(state,e["video_id"],m) and videos[e["video_id"]][m]["status"] == "available") for m in MODALITIES}
     incomplete = [{"video_id":e["video_id"], "modalities":[m for m in MODALITIES if not done(state,e["video_id"],m)]} for e in entries if any(not done(state,e["video_id"],m) for m in MODALITIES)]
-    quota = state.get("quota",{}).get(os.getenv("YOUTUBE_QUOTA_PROJECT","default"),{})
+    quota_projects = state.get("quota",{})
+    today = quota_day()
+    used_today = sum(value.get("used",0) for value in quota_projects.values() if value.get("date") == today)
+    used_total = sum(value.get("total_used",value.get("used",0)) for value in quota_projects.values())
     report = {"generated_at":datetime.now(timezone.utc).isoformat(), "total_submitted_rows":validation["submitted_rows"],
         "total_unique_valid_videos":len(entries), "validation_issues":validation["issues"], "validation_warnings":validation.get("warnings",[]), "completed":counts,
         "failed_or_unavailable":{m:sum(1 for e in entries if videos.get(e["video_id"],{}).get(m,{}).get("status") in {"error","unavailable","disabled","missing"}) for m in MODALITIES},
-        "estimated_api_quota_units_used_total":quota.get("total_used",0), "estimated_api_quota_units_used_today":quota.get("used",0), "remaining_incomplete_tasks":incomplete}
+        "estimated_api_quota_units_used_total":used_total, "estimated_api_quota_units_used_today":used_today,
+        "quota_by_project":{name:{"date":value.get("date"),"used_today":value.get("used",0),"used_total":value.get("total_used",value.get("used",0))} for name,value in quota_projects.items()},
+        "remaining_incomplete_tasks":incomplete}
     atomic_json(ROOT/"collection_report.json",report)
 
 
 def main() -> int:
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input",default="data/submissions.csv")
-    parser.add_argument("--max-comments",type=int,default=25)
-    parser.add_argument("--daily-quota",type=int,default=10000)
-    parser.add_argument("--quota-buffer",type=int,default=100)
+    parser.add_argument("--max-comments",type=int,default=None)
+    parser.add_argument("--daily-quota",type=int,default=None)
+    parser.add_argument("--quota-buffer",type=int,default=None)
     parser.add_argument("--no-wait-for-quota",action="store_true",help="Save progress and exit instead of waiting for the next daily quota reset.")
     args=parser.parse_args()
-    if not 0 <= args.max_comments <= 25: parser.error("--max-comments must be 0..25")
-    if args.daily_quota <= args.quota_buffer: parser.error("daily quota must exceed quota buffer")
+    config=read_json(CONFIG,{})
+    max_comments=args.max_comments if args.max_comments is not None else int(config.get("default_comment_limit",25))
+    daily_quota=args.daily_quota if args.daily_quota is not None else int(config.get("daily_quota_limit_per_project",10000))
+    quota_buffer=args.quota_buffer if args.quota_buffer is not None else int(config.get("quota_safety_buffer_per_project",100))
+    if not 0 <= max_comments <= 25: parser.error("--max-comments must be 0..25")
+    if daily_quota <= quota_buffer: parser.error("daily quota must exceed quota buffer")
     def stop(_sig,_frame):
         global interrupt_requested
         interrupt_requested=True
     signal.signal(signal.SIGINT,stop)
     while True:
-        result = collect(Path(args.input),args.max_comments,args.daily_quota,args.quota_buffer)
+        result = collect(Path(args.input),max_comments,daily_quota,quota_buffer)
         if result != 75 or args.no_wait_for_quota:
             return 1 if result == 75 else result
         delay = seconds_until_quota_reset()

@@ -1,21 +1,38 @@
 {
+  "dataset_name": "multimodal-clickbait-detection submissions",
+  "source_file": "data/submissions.csv",
+  "target_total_videos": 11194,
   "expected_categories": [
     "Entertainment",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    ""
+    "News",
+    "Gaming",
+    "Environment",
+    "Finance",
+    "Health",
+    "Product",
+    "Technology",
+    "Science",
+    "Sports",
+    "Other / Uncategorized"
   ],
-  "videos_per_category": 100,
-  "labels_per_category": {
-    "0": 50,
-    "1": 50
+  "category_counts": {
+    "Entertainment": 4784,
+    "News": 600,
+    "Gaming": 600,
+    "Environment": 600,
+    "Finance": 600,
+    "Health": 400,
+    "Product": 400,
+    "Technology": 202,
+    "Science": 154,
+    "Sports": 114,
+    "Other / Uncategorized": 2740
   },
-  "default_comment_limit": 20
+  "label_counts": {
+    "0": 5597,
+    "1": 5597
+  },
+  "default_comment_limit": 25,
+  "daily_quota_limit_per_project": 10000,
+  "quota_safety_buffer_per_project": 100
 }
-
