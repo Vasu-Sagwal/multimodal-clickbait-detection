@@ -1,15 +1,15 @@
 {
   "expected_categories": [
-    "Technology",
-    "News",
-    "Health",
-    "Product",
-    "Science",
-    "Gaming",
-    "Sports",
-    "Finance",
     "Entertainment",
-    "Environment"
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
   ],
   "videos_per_category": 100,
   "labels_per_category": {
