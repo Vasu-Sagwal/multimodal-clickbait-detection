@@ -5,3 +5,4 @@ __pycache__/
 *.py[cod]
 collection_state.json
 collection_report.json
+Thumbnail/
