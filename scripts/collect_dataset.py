@@ -257,6 +257,7 @@ class YouTubeClient:
 
 def metadata_batches(client: YouTubeClient, ids: list[str], on_batch=None) -> tuple[dict[str, dict], str | None]:
     output = {}
+    error_seen = False
     for index, vid in enumerate(ids, start=1):
         try:
             data = client.get("videos", {"part":"snippet", "id":vid})
@@ -264,7 +265,8 @@ def metadata_batches(client: YouTubeClient, ids: list[str], on_batch=None) -> tu
             return output, "quota"
         except CollectionError as exc:
             print(f"Metadata request failed for video {vid}: {exc}", file=sys.stderr)
-            return output, "error"
+            error_seen = True
+            continue
         item_output = {}
         for item in data.get("items", []):
             sn = item.get("snippet", {})
@@ -274,7 +276,7 @@ def metadata_batches(client: YouTubeClient, ids: list[str], on_batch=None) -> tu
         output.update(item_output)
         if on_batch:
             on_batch([vid], item_output, index)
-    return output, None
+    return output, "error" if error_seen else None
 
 
 def comments(client: YouTubeClient, vid: str, order: str, limit: int) -> dict:
