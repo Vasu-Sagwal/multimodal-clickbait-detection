@@ -11,9 +11,7 @@ import re
 import signal
 import sys
 import tempfile
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta, time as datetime_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -185,7 +183,6 @@ class YouTubeClient:
         self.bad_keys: set[int] = set()
         self.exhausted_projects: set[str] = set()
         self.checkpoint = checkpoint
-        self.lock = threading.Lock()
 
     def quota_for(self, project: str) -> dict:
         quota = self.state.setdefault("quota", {}).setdefault(project, {"date":quota_day(), "used":0, "total_used":0})
@@ -202,26 +199,27 @@ class YouTubeClient:
         errors = []
         saw_quota_exhaustion = False
         for _ in range(len(self.credentials)):
-            with self.lock:
-                idx = self.key_index % len(self.credentials)
-                self.key_index += 1
-                if idx in self.bad_keys:
-                    continue
-                key, project = self.credentials[idx]
-                if project in self.exhausted_projects:
-                    saw_quota_exhaustion = True
-                    continue
-                quota = self.quota_for(project)
-                if quota.get("used", 0) + cost > self.daily_limit-self.buffer:
-                    self.exhausted_projects.add(project)
-                    saw_quota_exhaustion = True
-                    continue
-                # Reserve quota before releasing the lock so concurrent requests
-                # cannot overspend the same project's safety limit.
-                quota["used"] = quota.get("used", 0) + cost
-                quota["total_used"] = quota.get("total_used", 0) + cost
-                if self.checkpoint:
-                    self.checkpoint()
+            idx = self.key_index % len(self.credentials)
+            if idx in self.bad_keys:
+                self.key_index = (idx + 1) % len(self.credentials)
+                continue
+            key, project = self.credentials[idx]
+            if project in self.exhausted_projects:
+                self.key_index = (idx + 1) % len(self.credentials)
+                saw_quota_exhaustion = True
+                continue
+            quota = self.quota_for(project)
+            if quota.get("used", 0) + cost > self.daily_limit-self.buffer:
+                self.exhausted_projects.add(project)
+                self.key_index = (idx + 1) % len(self.credentials)
+                saw_quota_exhaustion = True
+                continue
+            # Keep using this key for successive requests. Advance only when
+            # this key is invalid or its project's quota has run out.
+            quota["used"] = quota.get("used", 0) + cost
+            quota["total_used"] = quota.get("total_used", 0) + cost
+            if self.checkpoint:
+                self.checkpoint()
             query = dict(params, key=key)
             request = Request(f"https://www.googleapis.com/youtube/v3/{endpoint}?{urlencode(query)}", headers={"Accept":"application/json"})
             try:
@@ -236,15 +234,15 @@ class YouTubeClient:
                 except Exception:
                     reason = ""
                 if reason in {"quotaExceeded", "dailyLimitExceeded", "dailyLimitExceededUnreg"}:
-                    with self.lock:
-                        self.exhausted_projects.add(project)
+                    self.exhausted_projects.add(project)
+                    self.key_index = (idx + 1) % len(self.credentials)
                     saw_quota_exhaustion = True
                     if self.checkpoint:
                         self.checkpoint()
                     continue
                 if reason in {"keyInvalid", "authError", "ipRefererBlocked"} or exc.code == 401:
-                    with self.lock:
-                        self.bad_keys.add(idx)
+                    self.bad_keys.add(idx)
+                    self.key_index = (idx + 1) % len(self.credentials)
                     errors.append(reason or f"HTTP {exc.code}")
                     if self.checkpoint:
                         self.checkpoint()
@@ -259,44 +257,24 @@ class YouTubeClient:
 
 def metadata_batches(client: YouTubeClient, ids: list[str], on_batch=None) -> tuple[dict[str, dict], str | None]:
     output = {}
-    videos = list(enumerate(ids, start=1))
-
-    def fetch(index, vid):
+    for index, vid in enumerate(ids, start=1):
         try:
             data = client.get("videos", {"part":"snippet", "id":vid})
         except QuotaPaused:
-            return index, vid, None, "quota"
+            return output, "quota"
         except CollectionError as exc:
             print(f"Metadata request failed for video {vid}: {exc}", file=sys.stderr)
-            return index, vid, None, "error"
+            return output, "error"
         item_output = {}
         for item in data.get("items", []):
             sn = item.get("snippet", {})
             item_output[item["id"]] = {"title": sn.get("title"), "description": sn.get("description"), "tags": sn.get("tags", []),
                 "channel_title": sn.get("channelTitle"), "published_at": sn.get("publishedAt"), "category_id": sn.get("categoryId"),
                 "thumbnails": sn.get("thumbnails", {})}
-        return index, vid, item_output, None
-
-    stopped = None
-    # One request per video, with one worker per configured API key. This avoids
-    # a rejected multi-ID request blocking an entire group of videos.
-    workers = max(1, len(client.credentials))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(fetch, index, vid) for index, vid in videos]
-        for future in as_completed(futures):
-            index, vid, item_output, error = future.result()
-            item_output = item_output or {}
-            output.update(item_output)
-            if on_batch:
-                on_batch([vid], item_output, index)
-            if error:
-                stopped = error
-            if error == "quota":
-                for pending in futures:
-                    pending.cancel()
-                stopped = "quota"
-                break
-    return output, stopped
+        output.update(item_output)
+        if on_batch:
+            on_batch([vid], item_output, index)
+    return output, None
 
 
 def comments(client: YouTubeClient, vid: str, order: str, limit: int) -> dict:
@@ -459,21 +437,13 @@ def collect(input_path: Path, limit: int, daily_limit: int, buffer: int) -> int:
     metadata_paused = client.available_calls() < projected_calls
     atomic_json(MANIFEST, active_records(records, entries))
     atomic_json(STATE,state)
-    metadata_completed_since_save = 0
     def checkpoint_metadata(batch, result, batch_index):
-        nonlocal metadata_completed_since_save
         for vid in batch:
             if vid in result:
                 records[vid]["metadata"] = result[vid]
                 status_row(state,vid)["metadata"] = {"status":"available", "updated_at":datetime.now(timezone.utc).isoformat()}
             else:
                 status_row(state,vid)["metadata"] = {"status":"unavailable", "error":"Video not returned by videos.list"}
-        metadata_completed_since_save += len(batch)
-        # Save metadata progress every 500 completed individual video requests.
-        if metadata_completed_since_save >= 500:
-            metadata_completed_since_save %= 500
-            atomic_json(MANIFEST, active_records(records, entries))
-            atomic_json(STATE,state)
     metadata, metadata_stop = metadata_batches(client, missing_metadata, checkpoint_metadata)
     metadata_paused = metadata_paused or metadata_stop == "quota"
     metadata_error = metadata_stop == "error"
