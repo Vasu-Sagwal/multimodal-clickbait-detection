@@ -11,7 +11,9 @@ import re
 import signal
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta, time as datetime_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,7 +27,7 @@ CONFIG = ROOT / "dataset_config.json"
 STATE = ROOT / "collection_state.json"
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 LABELS = {"normal": 0, "clickbait": 1, "0": 0, "1": 1}
-MODALITIES = ("metadata", "thumbnail", "transcript", "comments_top", "comments_newest")
+MODALITIES = ("metadata", "thumbnail", "transcript", "comments_top")
 interrupt_requested = False
 
 
@@ -183,6 +185,7 @@ class YouTubeClient:
         self.bad_keys: set[int] = set()
         self.exhausted_projects: set[str] = set()
         self.checkpoint = checkpoint
+        self.lock = threading.Lock()
 
     def quota_for(self, project: str) -> dict:
         quota = self.state.setdefault("quota", {}).setdefault(project, {"date":quota_day(), "used":0, "total_used":0})
@@ -199,26 +202,30 @@ class YouTubeClient:
         errors = []
         saw_quota_exhaustion = False
         for _ in range(len(self.credentials)):
-            idx = self.key_index % len(self.credentials)
-            self.key_index += 1
-            if idx in self.bad_keys:
-                continue
-            key, project = self.credentials[idx]
-            if project in self.exhausted_projects:
-                continue
-            quota = self.quota_for(project)
-            if quota.get("used", 0) + cost > self.daily_limit-self.buffer:
-                self.exhausted_projects.add(project)
-                saw_quota_exhaustion = True
-                continue
-            query = dict(params, key=key)
-            request = Request(f"https://www.googleapis.com/youtube/v3/{endpoint}?{urlencode(query)}", headers={"Accept":"application/json"})
-            try:
-                # Count every attempted request conservatively, including API errors.
+            with self.lock:
+                idx = self.key_index % len(self.credentials)
+                self.key_index += 1
+                if idx in self.bad_keys:
+                    continue
+                key, project = self.credentials[idx]
+                if project in self.exhausted_projects:
+                    saw_quota_exhaustion = True
+                    continue
+                quota = self.quota_for(project)
+                if quota.get("used", 0) + cost > self.daily_limit-self.buffer:
+                    self.exhausted_projects.add(project)
+                    saw_quota_exhaustion = True
+                    continue
+                # Reserve quota before releasing the lock so concurrent requests
+                # cannot overspend the same project's safety limit.
                 quota["used"] = quota.get("used", 0) + cost
                 quota["total_used"] = quota.get("total_used", 0) + cost
                 if self.checkpoint:
                     self.checkpoint()
+            query = dict(params, key=key)
+            request = Request(f"https://www.googleapis.com/youtube/v3/{endpoint}?{urlencode(query)}", headers={"Accept":"application/json"})
+            try:
+                # Count every attempted request conservatively, including API errors.
                 with urlopen(request, timeout=30) as response:
                     data = json.loads(response.read().decode("utf-8"))
                 return data
@@ -229,13 +236,15 @@ class YouTubeClient:
                 except Exception:
                     reason = ""
                 if reason in {"quotaExceeded", "dailyLimitExceeded", "dailyLimitExceededUnreg"}:
-                    self.exhausted_projects.add(project)
+                    with self.lock:
+                        self.exhausted_projects.add(project)
                     saw_quota_exhaustion = True
                     if self.checkpoint:
                         self.checkpoint()
                     continue
                 if reason in {"keyInvalid", "authError", "ipRefererBlocked"} or exc.code == 401:
-                    self.bad_keys.add(idx)
+                    with self.lock:
+                        self.bad_keys.add(idx)
                     errors.append(reason or f"HTTP {exc.code}")
                     if self.checkpoint:
                         self.checkpoint()
@@ -250,26 +259,44 @@ class YouTubeClient:
 
 def metadata_batches(client: YouTubeClient, ids: list[str], on_batch=None) -> tuple[dict[str, dict], str | None]:
     output = {}
-    for batch_index, start in enumerate(range(0, len(ids), 50), start=1):
-        batch = ids[start:start+50]
+    videos = list(enumerate(ids, start=1))
+
+    def fetch(index, vid):
         try:
-            data = client.get("videos", {"part":"snippet", "id":",".join(batch)})
+            data = client.get("videos", {"part":"snippet", "id":vid})
         except QuotaPaused:
-            return output, "quota"
+            return index, vid, None, "quota"
         except CollectionError as exc:
-            print(f"Metadata batch paused: {exc}", file=sys.stderr)
-            return output, "error"
-        batch_output = {}
+            print(f"Metadata request failed for video {vid}: {exc}", file=sys.stderr)
+            return index, vid, None, "error"
+        item_output = {}
         for item in data.get("items", []):
             sn = item.get("snippet", {})
-            batch_output[item["id"]] = {"title": sn.get("title"), "description": sn.get("description"), "tags": sn.get("tags", []),
+            item_output[item["id"]] = {"title": sn.get("title"), "description": sn.get("description"), "tags": sn.get("tags", []),
                 "channel_title": sn.get("channelTitle"), "published_at": sn.get("publishedAt"), "category_id": sn.get("categoryId"),
                 "thumbnails": sn.get("thumbnails", {})}
-        output.update(batch_output)
-        if on_batch:
-            on_batch(batch, batch_output, batch_index)
-        time.sleep(0.05)
-    return output, None
+        return index, vid, item_output, None
+
+    stopped = None
+    # One request per video, with one worker per configured API key. This avoids
+    # a rejected multi-ID request blocking an entire group of videos.
+    workers = max(1, len(client.credentials))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch, index, vid) for index, vid in videos]
+        for future in as_completed(futures):
+            index, vid, item_output, error = future.result()
+            item_output = item_output or {}
+            output.update(item_output)
+            if on_batch:
+                on_batch([vid], item_output, index)
+            if error:
+                stopped = error
+            if error == "quota":
+                for pending in futures:
+                    pending.cancel()
+                stopped = "quota"
+                break
+    return output, stopped
 
 
 def comments(client: YouTubeClient, vid: str, order: str, limit: int) -> dict:
@@ -386,7 +413,7 @@ def hydrate_existing_state(state: dict, records: dict, entries: list[dict]) -> N
             status = value.get("status", record.get("transcript_status"))
             if status in {"available", "disabled", "unavailable"}:
                 statuses["transcript"] = {"status":status, "source":"existing file"}
-        for modality, key in (("comments_top", "top"), ("comments_newest", "newest")):
+        for modality, key in (("comments_top", "top"),):
             if statuses[modality].get("status") != "pending":
                 continue
             path_value = record.get("comments_paths", {}).get(key)
@@ -428,18 +455,23 @@ def collect(input_path: Path, limit: int, daily_limit: int, buffer: int) -> int:
         records[entry["video_id"]] = {**old, **entry}
     hydrate_existing_state(state, records, entries)
     missing_metadata = [e["video_id"] for e in entries if not done(state,e["video_id"],"metadata")]
-    projected_calls = len(missing_metadata) // 50 + bool(len(missing_metadata) % 50)
+    projected_calls = len(missing_metadata)
     metadata_paused = client.available_calls() < projected_calls
     atomic_json(MANIFEST, active_records(records, entries))
     atomic_json(STATE,state)
+    metadata_completed_since_save = 0
     def checkpoint_metadata(batch, result, batch_index):
+        nonlocal metadata_completed_since_save
         for vid in batch:
             if vid in result:
                 records[vid]["metadata"] = result[vid]
                 status_row(state,vid)["metadata"] = {"status":"available", "updated_at":datetime.now(timezone.utc).isoformat()}
             else:
                 status_row(state,vid)["metadata"] = {"status":"unavailable", "error":"Video not returned by videos.list"}
-        if batch_index % 5 == 0:
+        metadata_completed_since_save += len(batch)
+        # Save metadata progress every 500 completed individual video requests.
+        if metadata_completed_since_save >= 500:
+            metadata_completed_since_save %= 500
             atomic_json(MANIFEST, active_records(records, entries))
             atomic_json(STATE,state)
     metadata, metadata_stop = metadata_batches(client, missing_metadata, checkpoint_metadata)
@@ -478,14 +510,14 @@ def collect(input_path: Path, limit: int, daily_limit: int, buffer: int) -> int:
                 st["transcript"] = {"status":value["status"], "error":value.get("error")}
                 atomic_json(MANIFEST, active_records(records, entries))
                 atomic_json(STATE,state)
-            for label, order in (("comments_top","relevance"),("comments_newest","time")):
-                if done(state,vid,label): continue
+            label, order = "comments_top", "relevance"
+            if not done(state,vid,label):
                 value = comments(client,vid,order,limit)
-                path = ROOT / "comments" / f"{vid}_{'top' if order=='relevance' else 'newest'}.json"
+                path = ROOT / "comments" / f"{vid}_top.json"
                 atomic_json(path,value)
-                rec.setdefault("comments_paths",{})["top" if order=="relevance" else "newest"] = path.relative_to(ROOT).as_posix()
-                rec.setdefault("comments_status",{})["top" if order=="relevance" else "newest"] = value["status"]
-                rec.setdefault("comments_collected",{})["top" if order=="relevance" else "newest"] = value["count"]
+                rec.setdefault("comments_paths",{})["top"] = path.relative_to(ROOT).as_posix()
+                rec.setdefault("comments_status",{})["top"] = value["status"]
+                rec.setdefault("comments_collected",{})["top"] = value["count"]
                 st[label] = {"status":value["status"], "count":value["count"], "error":value.get("error")}
                 atomic_json(MANIFEST, active_records(records, entries))
                 atomic_json(STATE,state)
@@ -555,3 +587,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
