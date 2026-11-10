@@ -1,0 +1,2 @@
+model,test_rows,test_accuracy,test_f1,test_log_loss
+soft_vote_text_ann_cnn,634,0.9495268138801262,0.875,0.15035391869451592
