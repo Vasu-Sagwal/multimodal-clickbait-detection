@@ -24,9 +24,9 @@ Multimodal machine learning system for detecting misleading YouTube content usin
    python scripts/collect_dataset.py
    ```
 
-   It validates all rows before making requests, reports malformed and duplicate IDs, retrieves metadata in batches of 50, collects up to 25 relevance-ranked and 25 newest top-level comments separately, downloads the best available thumbnail, and fetches English-first transcripts without using YouTube API quota. Set `--input`, `--max-comments`, `--daily-quota`, or `--quota-buffer` to override defaults.
+   It validates all rows before making requests, reports malformed and duplicate IDs, retrieves metadata with one request per video in parallel across the configured API keys, collects up to 25 relevance-ranked top-level comments, downloads the best available thumbnail, and fetches English-first transcripts without using YouTube API quota. Individual metadata requests use more quota than batches of 50, so plan for one `videos.list` quota unit per video. Set `--input`, `--max-comments`, `--daily-quota`, or `--quota-buffer` to override defaults.
 
-5. Run it again after editing the CSV to synchronize the final manifest with the current submitted rows. Previously completed modalities are skipped. Interrupted runs can be restarted safely; incomplete work continues from the checkpoint. When all configured projects hit their daily quota limits, the program saves its checkpoint, waits for YouTube's midnight Pacific Time quota reset, then resumes automatically. Use `--no-wait-for-quota` to save and exit instead. Quota use is tracked separately by project ID.
+5. Run it again after editing the CSV to synchronize the final manifest with the current submitted rows. Previously completed modalities are skipped. Interrupted runs can be restarted safely; incomplete work continues from the checkpoint. Metadata progress is written every 500 completed videos, and completed modality work is saved as it finishes. Only the relevance-ranked top 25 comments are collected; newest comments are no longer requested. Existing newest-comment files, if present, are left untouched. When all configured projects hit their daily quota limits, the program saves its checkpoint, waits for YouTube's midnight Pacific Time quota reset, then resumes automatically. Use `--no-wait-for-quota` to save and exit instead. Quota use is tracked separately by project ID.
 
 ### Outputs
 
@@ -38,3 +38,4 @@ Multimodal machine learning system for detecting misleading YouTube content usin
 Only `videos.list` and `commentThreads.list` are charged to YouTube Data API quota. A metadata batch costs one unit; each comment page costs one unit. Extraction stops before the configured safety buffer and saves progress. YouTube's project quota error also pauses collection until quota resets. API keys are never written to output files or included in error text.
 
 Review generated data and applicable YouTube API terms before sharing or committing it. Never commit `.env` or API credentials.
+
