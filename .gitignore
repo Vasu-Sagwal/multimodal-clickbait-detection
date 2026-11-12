@@ -6,3 +6,4 @@ __pycache__/
 collection_state.json
 collection_report.json
 Thumbnail/
+.local-api-token
