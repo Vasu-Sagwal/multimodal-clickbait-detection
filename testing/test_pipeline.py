@@ -24,7 +24,7 @@ from PIL import Image
 from torch import nn
 from torchvision import transforms
 from torchvision.models import resnet18
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer, DistilBertConfig, DistilBertModel
 
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = ROOT / "models"
@@ -156,9 +156,11 @@ def require_checkpoint(path: Path) -> None:
 
 
 class TextClassifier(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, vocab_size: int) -> None:
         super().__init__()
-        self.encoder = AutoModel.from_pretrained("distilbert/distilbert-base-cased")
+        # The fine-tuned checkpoint contains the encoder weights, so construct
+        # the matching DistilBERT architecture without downloading base weights.
+        self.encoder = DistilBertModel(DistilBertConfig(vocab_size=vocab_size))
         self.dropout = nn.Dropout(0.2)
         self.classifier = nn.Linear(self.encoder.config.dim, 2)
 
@@ -189,7 +191,7 @@ def load_models():
         raise PipelineError("Missing saved tokenizer at models/text_classifier/tokenizer.")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True, use_fast=True)
-    text_model = TextClassifier().to(DEVICE)
+    text_model = TextClassifier(vocab_size=tokenizer.vocab_size).to(DEVICE)
     text_model.load_state_dict(torch.load(text_checkpoint, map_location=DEVICE, weights_only=True)["model_state_dict"])
     text_model.eval()
 

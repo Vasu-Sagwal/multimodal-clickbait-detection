@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101312" />
+    <meta name="description" content="Analyze a YouTube video for clickbait using the models running locally on your computer." />
+    <title>Clickbait Lens</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Clickbait Lens home">
+          <span class="brand-mark" aria-hidden="true">CL</span>
+          <span>CLICKBAIT <span class="brand-light">LENS</span></span>
+        </a>
+        <div class="topbar-note"><span class="dot"></span> LOCAL INFERENCE</div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div class="eyebrow"><span class="eyebrow-line"></span> MULTIMODAL VIDEO ANALYSIS</div>
+          <h1>Look past the<br /><span>headline.</span></h1>
+          <p class="hero-copy">One video. Four signals. A clearer read on whether the story matches the packaging.</p>
+        </section>
+
+        <section class="workspace" aria-label="Video analysis">
+          <div class="input-card">
+            <div class="section-heading">
+              <div>
+                <div class="step-label">01 <span>·</span> VIDEO SOURCE</div>
+                <h2>Paste a YouTube link</h2>
+              </div>
+              <span class="source-badge">YOUTUBE</span>
+            </div>
+            <form id="analysis-form">
+              <label class="field-label" for="video-url">VIDEO URL</label>
+              <div class="url-field">
+                <span class="link-icon" aria-hidden="true">↗</span>
+                <input id="video-url" name="video-url" type="url" placeholder="https://www.youtube.com/watch?v=…" required autocomplete="url" />
+                <button id="analyze-button" class="analyze-button" type="submit"><span>Analyze video</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+              </div>
+              <p class="field-hint">Uses the title, description, thumbnail and public video statistics.</p>
+            </form>
+
+            <details class="connection-settings" id="connection-settings">
+              <summary><span class="settings-icon" aria-hidden="true">⌘</span><span>Connect your local model</span><span class="settings-chevron" aria-hidden="true">⌄</span></summary>
+              <div class="settings-body">
+                <p>Your browser sends the video URL to FastAPI on this computer. Models and inference stay local; Vercel only serves this page.</p>
+                <div class="settings-grid">
+                  <label class="field-label" for="api-url">LOCAL API ADDRESS
+                    <input id="api-url" type="url" value="http://127.0.0.1:8000" autocomplete="url" />
+                  </label>
+                  <label class="field-label" for="api-token">LOCAL API TOKEN
+                    <input id="api-token" type="password" placeholder="Paste the token from the FastAPI window" autocomplete="off" />
+                  </label>
+                </div>
+                <div class="settings-actions">
+                  <button id="check-connection" class="secondary-button" type="button">Check connection</button>
+                  <span class="connection-status" id="connection-status" role="status">Start FastAPI on this PC, then connect.</span>
+                </div>
+                <p class="privacy-note">The token stays in this browser tab and is never sent to Vercel.</p>
+              </div>
+            </details>
+          </div>
+
+          <section id="result-card" class="result-card hidden" aria-live="polite">
+            <div class="result-topline"><div class="step-label">02 <span>·</span> ANALYSIS RESULT</div><span class="result-chip" id="result-chip">COMPLETE</span></div>
+            <div class="result-head">
+              <div>
+                <div class="result-kicker">FINAL CLASSIFICATION</div>
+                <h2 id="result-label">—</h2>
+                <p id="result-title" class="video-title"></p>
+              </div>
+              <div class="score-ring" id="score-ring"><span id="fusion-score">—</span><small>FUSION SCORE</small></div>
+            </div>
+            <div class="score-grid">
+              <article class="score-card"><div class="score-card-top"><span>01 / TEXT</span><strong id="text-score">—</strong></div><div class="score-track"><span id="text-bar"></span></div><p>Title + description</p></article>
+              <article class="score-card"><div class="score-card-top"><span>02 / THUMBNAIL</span><strong id="thumbnail-score">—</strong></div><div class="score-track"><span id="thumbnail-bar"></span></div><p>Visual signal</p></article>
+              <article class="score-card"><div class="score-card-top"><span>03 / METADATA</span><strong id="metadata-score">—</strong></div><div class="score-track"><span id="metadata-bar"></span></div><p>Engagement + duration</p></article>
+            </div>
+            <div class="video-facts" id="video-facts"></div>
+            <p class="result-footnote">Scores show each model’s clickbait probability. The final label uses the saved fusion threshold.</p>
+          </section>
+
+          <section class="how-it-works">
+            <div class="step-label">HOW IT WORKS</div>
+            <div class="how-grid">
+              <div><span class="how-number">01</span><p>The local API retrieves public video details and its thumbnail.</p></div>
+              <div><span class="how-number">02</span><p>Text, thumbnail and metadata models score the video on your PC.</p></div>
+              <div><span class="how-number">03</span><p>The fusion model combines those scores into the final result.</p></div>
+            </div>
+          </section>
+        </section>
+      </main>
+
+      <footer class="footer"><span>CLICKBAIT LENS · MULTIMODAL DETECTION</span><span>INFERENCE STAYS ON YOUR COMPUTER</span></footer>
+    </div>
+  </body>
+</html>
